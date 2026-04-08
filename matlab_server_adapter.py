@@ -6,6 +6,7 @@ carry the command array protocol defined in soc_protocol.py which was outlined b
 """
 
 import argparse
+import signal
 
 import numpy as np
 
@@ -221,21 +222,39 @@ def main():
         host = args.host
     else:
         host = "0.0.0.0"
-    print("Waiting for MATLAB client on %s:%d", host, args.port)
+    print("Waiting for MATLAB client on %s:%d" % (host, args.port))
     
     if args.image_channels <= 1:
         image_shape = (args.image_height, args.image_width)
     else:
         image_shape = (args.image_height, args.image_width, args.image_channels)
 
+    adapter = MatlabServerAdapter(
+        host=args.host,
+        port=args.port,
+        image_shape=image_shape
+    )
+    stop_requested = {"value": False}
+
+    def handle_stop_signal(signum, frame):
+        del signum
+        del frame
+        stop_requested["value"] = True
+        adapter.close()
+
+    signal.signal(signal.SIGINT, handle_stop_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_stop_signal)
+
     try:
-        MatlabServerAdapter(
-            host=args.host,
-            port=args.port,
-            image_shape=image_shape
-        ).serve_forever()
-    except ConnectionError:
-        print("TCP connection closed")
+        adapter.serve_forever()
+    except (ConnectionError, OSError):
+        if stop_requested["value"]:
+            print("TCP server stopped")
+        else:
+            print("TCP connection closed")
+    except KeyboardInterrupt:
+        print("TCP server stopped")
 
 
 if __name__ == "__main__":

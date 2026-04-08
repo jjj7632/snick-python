@@ -63,6 +63,8 @@ class NumpySocket(object):
     def activeSocket(self):
         if self.client_connection is not None:
             return self.client_connection
+        if self.socket is None:
+            raise ConnectionError("Socket is closed")
         return self.socket
 
     # Return the byte count for one image using the configured shape and dtype
