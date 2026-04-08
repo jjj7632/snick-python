@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from image_cache import LatestFrameStore
+from fpga_buffer_manager import PingPongFpgaCache
 
 
 CMD_RESET = 1
@@ -81,17 +82,61 @@ class SoCProtocol(object):
 
     # Run the fast primary processing path used in master mode
     def fast_process_image(self, frame_number, image_data):
+        # TODO:
+        """
+        # 1. Send the image info to the FPGA fast path
+                - this requires setting up DDR, probably utilizing AXI-Lite for actual image caching
+                  so that the fpga can read (Josh is working on this as his next task)
+                        a.) allocate a 2 DDR frame ping pong buffer that Python can fille and FPGA can read from
+                        b.) copy the latest image into it
+                        c.) store its physical address
+                        d.) write that address to FPGA registers
+                        e.) trigger the FPGA
+        # 2. Read back the FPGA estimated ball position
+        # 3. Convert the FPGA output into x/y/z values in Python
+        # 4. Check whether the FPGA result is reasonable compared to recent history
+        # 5. Flag whether the result should be sent to the fallback path
+        # 6. Flag whether this frame looks like a possible out call
+        # 7. Return the frame number, x/y/z position, reasonableness, and likely_out status
+        """
+
+        #TODO: Finish the PingPongFPGACache thats barely started in fpga_buffer_manager.py (Josh can do this)
+        cache = PingPongFpgaCache()
+
+        cache.submit_frame(frame_number=42, image_data=image_data)
+        result = cache.read_result()
+
+        print(result)
+        
+        
+        # Reasonable Logic... blah blah blah
+        reasonable = True
+
+        # Likely out Logic... blah blah blah
+        likely_out = False
+
         return {
             "frame_number": frame_number,
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0,
-            "reasonable": True,
-            "likely_out": False
+            "x": result["x"],
+            "y": result["y"],
+            "z": result["z"],
+            "reasonable": reasonable,
+            "likely_out": likely_out
         }
 
     # Run the slower fallback processing path used for replay or bad calls
     def fallback_process_image(self, frame_number, image_data):
+        # TODO:
+        """ 
+        # 1. Preprocess the input image for the slower fallback path
+        # 2. Run the fallback ball detection / position estimation algorithm
+        # 3. Recover the best ball position for this frame
+        # 4. Apply any extra validation or cleanup the fallback path needs
+        # 5. Determine whether the result is reasonable
+        # 6. Determine whether the frame still suggests a possible out call
+        # 7. Return the frame number, x/y/z position, reasonableness, and likely_out status
+        """
+
         return {
             "frame_number": frame_number,
             "x": 0.0,
@@ -114,6 +159,20 @@ class SoCProtocol(object):
         self.waiting_for_image = False
 
     def perform_backtracking_procedure(self, frame_number):
+
+        #TODO:
+        """ My idea of the backtracking procedure:
+            1. Start from the suspicious frame where the ball looked likely out
+            2. Request earlier and/or nearby replay frames from Matlab
+            3. For each returned frame, run the fallback image processing algorithm
+            4. Track how the ball position changes across those frames
+            5. Find the bounce frame or best contact point with the court
+            6. Compare that position against the court lines
+            7. Decide whether the ball was in or out
+            8. Send the final in/out call back to Matlab
+        Note: A lot of prerequisites are needed for this function to actually be implemented
+        """
+
         return {
             "frame_number": frame_number,
             "confirmed_out": True
