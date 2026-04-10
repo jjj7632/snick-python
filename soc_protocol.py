@@ -22,12 +22,13 @@ MODE_SLAVE = "slave"
 
 class SoCProtocol(object):
     # Initialize SoC mode, the capture state, and the outbound commands
-    def __init__(self, command_sender=None):
+    def __init__(self, command_sender=None, fpga_cache=None):
         self.mode = MODE_MASTER
         self.latest_frame = LatestFrameStore()
         self.capture_enabled = True
         self.command_sender = command_sender
         self.waiting_for_image = False
+        self.fpga_cache = fpga_cache
 
     # Send a command outward through the configured transport callback
     def send_command(self, cmd_array):
@@ -100,11 +101,11 @@ class SoCProtocol(object):
         # 7. Return the frame number, x/y/z position, reasonableness, and likely_out status
         """
 
-        #TODO: Finish the PingPongFPGACache thats barely started in fpga_buffer_manager.py (Josh can do this)
-        cache = PingPongFpgaCache()
+        if self.fpga_cache is None:
+            raise RuntimeError("fpga_cache must be configured with a DMA-backed PingPongFpgaCache")
 
-        cache.submit_frame(frame_number=42, image_data=image_data)
-        result = cache.read_result()
+        self.fpga_cache.submit_frame(frame_number=frame_number, image_data=image_data)
+        result = self.fpga_cache.read_result()
 
         print(result)
         

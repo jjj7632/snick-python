@@ -10,6 +10,7 @@ import signal
 
 import numpy as np
 
+from fpga_buffer_manager import PingPongFpgaCache
 from numpysocket import NumpySocket
 from soc_protocol import (
     CMD_LOG_DATA,
@@ -25,6 +26,9 @@ from soc_protocol import (
     CMD_STOP_CAPTURE,
     SoCProtocol,
 )
+
+OVERLAY_BIT = ""
+DMA_NAME = ""
 
 
 COMMANDS_WITHOUT_ARGS = {
@@ -44,15 +48,20 @@ COMMANDS_WITH_ONE_INT = {
 
 class MatlabServerAdapter(object):
     # Set up the TCP server and bind it to a SoC protocol instance
-    def __init__(self, host="", port=9999, image_shape=None, protocol=None):
+    def __init__(self, host="", port=9999, image_shape=None, protocol=None, fpga_cache=None):
         self.host = host
         self.port = port
         if image_shape is None:
             image_shape = (1080, 1920, 3)
         self.image_shape = tuple(image_shape)
         self.socket = NumpySocket(image_shape=self.image_shape)
-        self.protocol = protocol or SoCProtocol(command_sender=self.send_soc_command)
+        self.fpga_cache = fpga_cache
+        self.protocol = protocol or SoCProtocol(
+            command_sender=self.send_soc_command,
+            fpga_cache=self.fpga_cache
+        )
         self.protocol.command_sender = self.send_soc_command
+        self.protocol.fpga_cache = self.fpga_cache
         self.is_running = False
 
     # Accept an incoming MATLAB or PC TCP client connection
@@ -64,6 +73,12 @@ class MatlabServerAdapter(object):
     def close(self):
         self.is_running = False
         self.socket.close()
+        if self.fpga_cache is not None:
+            try:
+                self.fpga_cache.close()
+            except AttributeError:
+                pass
+            self.fpga_cache = None
 
     # Process incoming commands until the client disconnects or a limit is reached
     def serve(self, max_packets=None):
@@ -215,6 +230,29 @@ def build_argument_parser():
     return parser
 
 
+# Build a DMA-backed FPGA cache when overlay settings are provided
+def build_fpga_cache(image_shape):
+    if not OVERLAY_BIT and not DMA_NAME:
+        return None
+
+    if not OVERLAY_BIT or not DMA_NAME:
+        raise ValueError("Both OVERLAY_BIT and DMA_NAME must be set for fpga_cache setup")
+
+    from pynq import Overlay
+
+    overlay = Overlay(OVERLAY_BIT)
+
+    if not hasattr(overlay, DMA_NAME):
+        raise ValueError("DMA IP '%s' was not found in the loaded overlay" % DMA_NAME)
+
+    dma_engine = getattr(overlay, DMA_NAME)
+    fpga_cache = PingPongFpgaCache(
+        dma_engine=dma_engine,
+        image_shape=image_shape
+    )
+    return overlay, fpga_cache
+
+
 # Start the adapter from the command line and wait for a client
 def main():
     args = build_argument_parser().parse_args()
@@ -229,10 +267,17 @@ def main():
     else:
         image_shape = (args.image_height, args.image_width, args.image_channels)
 
+    overlay = None
+    fpga_cache = None
+    fpga_setup = build_fpga_cache(image_shape)
+    if fpga_setup is not None:
+        overlay, fpga_cache = fpga_setup
+
     adapter = MatlabServerAdapter(
         host=args.host,
         port=args.port,
-        image_shape=image_shape
+        image_shape=image_shape,
+        fpga_cache=fpga_cache
     )
     stop_requested = {"value": False}
 
