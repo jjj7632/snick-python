@@ -15,17 +15,19 @@ except ImportError:
 # AXI lite register memory map, we need to map these to real offsets from the IP Base
 CTRL = 0x00
 STATUS = 0x04
-FRAME_ADDR = 0x08
-FRAME_WIDTH = 0x0C
-FRAME_HEIGHT = 0x10
-FRAME_CHANS = 0x14
-FRAME_ID = 0x18
-BUFFER_INDEX = 0x1C
+LEFT_FRAME_ADDR = 0x08
+RIGHT_FRAME_ADDR = 0x0C
+FRAME_WIDTH = 0x10
+FRAME_HEIGHT = 0x14
+FRAME_CHANS = 0x18
+FRAME_ID = 0x1C
+BUFFER_INDEX = 0x20
+
 
 # Result in Memory
-RESULT_X = 0x20
-RESULT_Y = 0x24
-RESULT_Z = 0x28
+RESULT_X = 0x24
+RESULT_Y = 0x28
+RESULT_Z = 0x2C
 
 # IP Config
 IP_BASE = 0x43C60000    
@@ -66,15 +68,20 @@ class PingPongFpgaCache(object):
         self.last_frame_number = None
         self.mem_file = None
         self.regs = None
-        self.buffers = self.allocate_buffers()
+        self.left_buffers, self.right_buffers = self.allocate_buffers()
         self.open_registers()
 
     # Allocate two ping pong frame buffers that are FPGA visible
     def allocate_buffers(self):
-        return [
+        left_buffers = [
             allocate(shape=self.image_shape, dtype=self.image_dtype),
             allocate(shape=self.image_shape, dtype=self.image_dtype),
         ]
+        right_buffers = [
+            allocate(shape=self.image_shape, dtype=self.image_dtype),
+            allocate(shape=self.image_shape, dtype=self.image_dtype),
+        ]
+        return left_buffers, right_buffers
 
     # Open the AXI register window on hardware
     def open_registers(self):
@@ -89,10 +96,11 @@ class PingPongFpgaCache(object):
             if self.mem_file is not None:
                 self.mem_file.close()
                 self.mem_file = None
+            raise
 
-    # Return the active frame buffer that Python should fill next
-    def current_buffer(self):
-        return self.buffers[self.write_index]
+    # Return the active stereo buffer pair that Python should fill next
+    def current_buffer_pair(self):
+        return self.left_buffers[self.write_index], self.right_buffers[self.write_index]
 
     # Copy an image into the current ping pong buffer
     def copy_into_buffer(self, buffer_obj, image_data):
@@ -104,9 +112,18 @@ class PingPongFpgaCache(object):
         if hasattr(buffer_obj, "flush"):
             buffer_obj.flush()
 
-    # Return the device address for a hardware backed buffer
+    # Return the device address for the hardware backed buffer
     def buffer_address(self, buffer_obj):
         return int(buffer_obj.device_address)
+
+    # Return a left and right image from the stereo image data
+    def extract_stereo_images(self, image_data):
+        if isinstance(image_data, dict):
+            # strict contract that image data will come in a dict with these key value pairs
+            if "left_image" in image_data and "right_image" in image_data:
+                return image_data["left_image"], image_data["right_image"]
+
+        raise ValueError("image_data must be a stereo dict with left_image and right_image")
 
     # Write one unsigned AXI register value
     def write_reg_u32(self, offset, value):
@@ -143,9 +160,10 @@ class PingPongFpgaCache(object):
                 raise TimeoutError("Timed out waiting for FPGA to go idle")
             time.sleep(self.poll_interval_s)
 
-    # Start the AXI DMA processing path for the current frame buffer
-    def start_hardware_transfer(self, buffer_obj, frame_number):
-        self.write_reg_u32(FRAME_ADDR, self.buffer_address(buffer_obj))
+    # Start the AXI DMA processing path for the current stereo buffer pair
+    def start_hardware_transfer(self, left_buffer, right_buffer, frame_number):
+        self.write_reg_u32(LEFT_FRAME_ADDR, self.buffer_address(left_buffer))
+        self.write_reg_u32(RIGHT_FRAME_ADDR, self.buffer_address(right_buffer))
         self.write_reg_u32(FRAME_WIDTH, self.image_shape[1])
         self.write_reg_u32(FRAME_HEIGHT, self.image_shape[0])
 
@@ -160,23 +178,35 @@ class PingPongFpgaCache(object):
         else:
             self.write_reg_u32(FRAME_ID, frame_number)
         self.write_reg_u32(BUFFER_INDEX, self.write_index)
-        self.submit_dma(buffer_obj)
+        self.submit_dma(left_buffer, right_buffer)
         self.write_reg_u32(CTRL, 1)
 
-    # Submit the current buffer to the required DMA engine
-    def submit_dma(self, buffer_obj):
+    # Submit the current stereo buffers to the required DMA engine
+    def submit_dma(self, left_buffer, right_buffer):
+        if hasattr(self.dma_engine, "sendchannel_left") and hasattr(self.dma_engine, "sendchannel_right"):
+            self.dma_engine.sendchannel_left.transfer(left_buffer)
+            self.dma_engine.sendchannel_right.transfer(right_buffer)
+            return
+
         if hasattr(self.dma_engine, "sendchannel"):
-            self.dma_engine.sendchannel.transfer(buffer_obj)
+            self.dma_engine.sendchannel.transfer(left_buffer)
+            self.dma_engine.sendchannel.wait()
+            self.dma_engine.sendchannel.transfer(right_buffer)
             return
 
         if hasattr(self.dma_engine, "transfer"):
-            self.dma_engine.transfer(buffer_obj)
+            self.dma_engine.transfer(left_buffer, right_buffer)
             return
 
         raise TypeError("Unsupported DMA engine interface")
 
     # Wait for DMA transfer to complete
     def wait_for_dma(self):
+        if hasattr(self.dma_engine, "sendchannel_left") and hasattr(self.dma_engine, "sendchannel_right"):
+            self.dma_engine.sendchannel_left.wait()
+            self.dma_engine.sendchannel_right.wait()
+            return
+
         if hasattr(self.dma_engine, "sendchannel"):
             self.dma_engine.sendchannel.wait()
             return
@@ -191,12 +221,14 @@ class PingPongFpgaCache(object):
             frame_number = -1
 
         self.wait_until_idle()
-        buffer_obj = self.current_buffer()
-        self.copy_into_buffer(buffer_obj, image_data)
+        left_image, right_image = self.extract_stereo_images(image_data)
+        left_buffer, right_buffer = self.current_buffer_pair()
+        self.copy_into_buffer(left_buffer, left_image)
+        self.copy_into_buffer(right_buffer, right_image)
 
         self.last_frame_number = frame_number
         self.last_submitted_index = self.write_index
-        self.start_hardware_transfer(buffer_obj, frame_number)
+        self.start_hardware_transfer(left_buffer, right_buffer, frame_number)
         self.write_index = 1 - self.write_index
 
     # Read the latest FPGA output after the DMA transfer completes
@@ -212,12 +244,19 @@ class PingPongFpgaCache(object):
 
     # Release allocated frame buffers and AXI register mappings
     def close(self):
-        for buffer_obj in self.buffers:
+        for buffer_obj in self.left_buffers:
             try:
                 buffer_obj.close()
             except AttributeError:
                 pass
-        self.buffers = []
+
+        for buffer_obj in self.right_buffers:
+            try:
+                buffer_obj.close()
+            except AttributeError:
+                pass
+        self.left_buffers = []
+        self.right_buffers = []
 
         if self.regs is not None:
             self.regs.close()

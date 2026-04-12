@@ -141,7 +141,7 @@ class SoCProtocol(object):
         CY       = 1080 / 2.0
         BASELINE = 0.10
 
-        left_frame_number, left_image, right_image = self.extract_stereo_pair(frame_number, image_data)
+        frame_num, left_image, right_image = self.extract_stereo_pair(frame_number, image_data)
 
         # Convert to HSV and threshold to isolate tennis ball yellow-green pixels
         hsv_lower = np.array([25, 80, 80],   dtype=np.uint8)
@@ -176,7 +176,7 @@ class SoCProtocol(object):
 
         # Ball not detected in one or both frames
         if left_centroid is None or right_centroid is None:
-            return {"frame_number": left_frame_number, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
+            return {"frame_number": frame_num, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
 
         # Compute real world x/y/z
         u_left, v_left = left_centroid
@@ -184,14 +184,14 @@ class SoCProtocol(object):
         disparity      = u_left - u_right
 
         if disparity <= 1.0:
-            return {"frame_number": left_frame_number, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
+            return {"frame_number": frame_num, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
 
         z = (FOCAL_PX * BASELINE) / disparity
         x = (u_left - CX) * z / FOCAL_PX
         y = (v_left - CY) * z / FOCAL_PX
 
         return {
-            "frame_number": left_frame_number,
+            "frame_number": frame_num,
             "x": x,
             "y": y,
             "z": z,

@@ -139,7 +139,12 @@ class MatlabServerAdapter(object):
 
         if cmd == CMD_PROCESS_IMAGE:
             frame_number = self.restore_frame_number(self.socket.receiveInt32())
-            image_data = self.socket.receive()
+            left_image = self.socket.receive()
+            right_image = self.socket.receive()
+            image_data = {
+                "left_image": left_image,
+                "right_image": right_image
+            }
             return [cmd, frame_number, image_data]
 
         raise ValueError("Unsupported command received from socket: %s" % str(cmd))
@@ -175,7 +180,14 @@ class MatlabServerAdapter(object):
 
         if cmd == CMD_PROCESS_IMAGE:
             self.socket.sendInt32(self.normalize_frame_number(command[1]))
-            self.socket.send(np.asarray(command[2], dtype=self.socket.image_dtype))
+            image_data = command[2]
+            if isinstance(image_data, dict) and "left_image" in image_data and "right_image" in image_data:
+                left_image = image_data["left_image"]
+                right_image = image_data["right_image"]
+            else:
+                raise ValueError("processImage expects a stereo dict with left_image and right_image")
+            self.socket.send(np.asarray(left_image, dtype=self.socket.image_dtype))
+            self.socket.send(np.asarray(right_image, dtype=self.socket.image_dtype))
             return
 
         raise ValueError("Unsupported command for socket send: %s" % str(cmd))
