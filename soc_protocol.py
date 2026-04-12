@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 
 from image_cache import LatestFrameStore
-from fpga_buffer_manager import PingPongFpgaCache
+import cv2
+import numpy as np
 
 
 CMD_RESET = 1
@@ -102,7 +103,7 @@ class SoCProtocol(object):
         """
 
         if self.fpga_cache is None:
-            raise RuntimeError("fpga_cache must be configured with a DMA-backed PingPongFpgaCache")
+            raise RuntimeError("fpga_cache must be configured with a DMA backed PingPongFpgaCache")
 
         self.fpga_cache.submit_frame(frame_number=frame_number, image_data=image_data)
         result = self.fpga_cache.read_result()
@@ -126,23 +127,74 @@ class SoCProtocol(object):
         }
 
     # Run the slower fallback processing path used for replay or bad calls
+    def extract_stereo_pair(self, frame_number, image_data):
+        if isinstance(image_data, dict) and "left_image" in image_data and "right_image" in image_data:
+            return frame_number, image_data["left_image"], image_data["right_image"]
+
+        raise ValueError("fallback_process_image expects an already-paired stereo frame")
+
+    # Run the slower fallback processing path used for replay or bad calls
     def fallback_process_image(self, frame_number, image_data):
-        # TODO:
-        """ 
-        # 1. Preprocess the input image for the slower fallback path
-        # 2. Run the fallback ball detection / position estimation algorithm
-        # 3. Recover the best ball position for this frame
-        # 4. Apply any extra validation or cleanup the fallback path needs
-        # 5. Determine whether the result is reasonable
-        # 6. Determine whether the frame still suggests a possible out call
-        # 7. Return the frame number, x/y/z position, reasonableness, and likely_out status
-        """
+        # Camera constants
+        FOCAL_PX = 10.0 / 0.006
+        CX       = 1920 / 2.0
+        CY       = 1080 / 2.0
+        BASELINE = 0.10
+
+        left_frame_number, left_image, right_image = self.extract_stereo_pair(frame_number, image_data)
+
+        # Convert to HSV and threshold to isolate tennis ball yellow-green pixels
+        hsv_lower = np.array([25, 80, 80],   dtype=np.uint8)
+        hsv_upper = np.array([65, 255, 255], dtype=np.uint8)
+        left_mask  = cv2.inRange(cv2.cvtColor(left_image,  cv2.COLOR_RGB2HSV), hsv_lower, hsv_upper)
+        right_mask = cv2.inRange(cv2.cvtColor(right_image, cv2.COLOR_RGB2HSV), hsv_lower, hsv_upper)
+
+        # Find the most circular contour in the mask and return its pixel centroid
+        def get_centroid(mask):
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            best, best_score = None, 0.0
+            for c in contours:
+                area = cv2.contourArea(c)
+                perimeter = cv2.arcLength(c, True)
+                if area < 50 or perimeter == 0:       # raised from 20 to 50
+                    continue
+                circularity = (4.0 * np.pi * area) / (perimeter ** 2)
+                if circularity > best_score:
+                    best, best_score = c, circularity
+            if best is None or best_score < 0.4:      # lowered from 0.6 to 0.4
+                return None
+            m = cv2.moments(best)
+            if m["m00"] == 0:
+                return None
+            return (m["m10"] / m["m00"], m["m01"] / m["m00"])
+
+        left_centroid  = get_centroid(left_mask)
+        right_centroid = get_centroid(right_mask)
+
+        # Ball not detected in one or both frames
+        if left_centroid is None or right_centroid is None:
+            return {"frame_number": left_frame_number, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
+
+        # Compute real world x/y/z
+        u_left, v_left = left_centroid
+        u_right        = right_centroid[0]
+        disparity      = u_left - u_right
+
+        if disparity <= 1.0:
+            return {"frame_number": left_frame_number, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
+
+        z = (FOCAL_PX * BASELINE) / disparity
+        x = (u_left - CX) * z / FOCAL_PX
+        y = (v_left - CY) * z / FOCAL_PX
 
         return {
-            "frame_number": frame_number,
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0,
+            "frame_number": left_frame_number,
+            "x": x,
+            "y": y,
+            "z": z,
             "reasonable": True,
             "likely_out": False
         }
