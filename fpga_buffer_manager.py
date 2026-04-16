@@ -5,12 +5,6 @@ import time
 
 import numpy as np
 
-# Saved me a headache, serves like a macro
-try:
-    from pynq import allocate
-except ImportError:
-    allocate = None
-
 
 # AXI lite register memory map, we need to map these to real offsets from the IP Base
 CTRL = 0x00
@@ -37,6 +31,15 @@ IP_SIZE = 0x1000
 IMAGE_SHAPE = (1080, 1920, 3)
 IMAGE_DTYPE = np.uint8
 
+
+def get_pynq_allocate():
+    try:
+        from pynq import allocate
+    except Exception as exc:
+        raise RuntimeError("pynq.allocate is required for the DMA frame buffer path") from exc
+    return allocate
+
+
 class PingPongFpgaCache(object):
     # Create FPGA visible frame buffers and required AXI register access
     def __init__(
@@ -50,8 +53,6 @@ class PingPongFpgaCache(object):
         timeout_s=1.0,
         poll_interval_s=0.001,
     ):
-        if allocate is None:
-            raise RuntimeError("pynq.allocate is required for the DMA frame buffer path")
         if dma_engine is None:
             raise RuntimeError("dma_engine is required for PingPongFpgaCache")
 
@@ -68,18 +69,19 @@ class PingPongFpgaCache(object):
         self.last_frame_number = None
         self.mem_file = None
         self.regs = None
+        self.allocate = get_pynq_allocate()
         self.left_buffers, self.right_buffers = self.allocate_buffers()
         self.open_registers()
 
     # Allocate two ping pong frame buffers that are FPGA visible
     def allocate_buffers(self):
         left_buffers = [
-            allocate(shape=self.image_shape, dtype=self.image_dtype),
-            allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
         ]
         right_buffers = [
-            allocate(shape=self.image_shape, dtype=self.image_dtype),
-            allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
         ]
         return left_buffers, right_buffers
 

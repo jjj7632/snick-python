@@ -6,13 +6,23 @@ carry the command array protocol defined in soc_protocol.py which was outlined b
 """
 
 import argparse
+import os
 import signal
+import sys
 
 import numpy as np
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 from fpga_buffer_manager import PingPongFpgaCache
-from numpysocket import NumpySocket
-from soc_protocol import (
+from shared_protocol.numpysocket import NumpySocket
+from shared_protocol.soc_protocol import (
     CMD_LOG_DATA,
     CMD_PROCESS_IMAGE,
     CMD_REQUEST_IMAGE_AT_FRAME,
@@ -305,11 +315,11 @@ def main():
 
     try:
         adapter.serve_forever()
-    except (ConnectionError, OSError):
+    except (ConnectionError, OSError) as exc:
         if stop_requested["value"]:
             print("TCP server stopped")
         else:
-            print("TCP connection closed")
+            print("TCP connection closed:", exc)
     except KeyboardInterrupt:
         print("TCP server stopped")
 
