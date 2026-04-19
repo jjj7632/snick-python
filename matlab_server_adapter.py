@@ -37,8 +37,11 @@ from shared_protocol.soc_protocol import (
     SoCProtocol,
 )
 
-OVERLAY_BIT = ""
-DMA_NAME = ""
+DEFAULT_OVERLAY_BIT = ""
+DEFAULT_LEFT_DMA_NAME = ""
+DEFAULT_RIGHT_DMA_NAME = ""
+DEFAULT_FPGA_IP_BASE = 0x43C60000
+DEFAULT_FPGA_IP_SIZE = 0x1000
 
 
 COMMANDS_WITHOUT_ARGS = {
@@ -54,6 +57,20 @@ COMMANDS_WITH_ONE_INT = {
     CMD_REQUEST_NTH_NEXT_IMAGE,
     CMD_REQUEST_NTH_PREVIOUS_IMAGE,
 }
+
+
+class StereoDmaEngine(object):
+    # Small adapter that lets the FPGA cache treat two PYNQ DMA IPs as one stereo engine
+    def __init__(self, left_dma, right_dma):
+        if not hasattr(left_dma, "sendchannel"):
+            raise TypeError("left DMA object must expose sendchannel")
+        if not hasattr(right_dma, "sendchannel"):
+            raise TypeError("right DMA object must expose sendchannel")
+
+        self.left_dma = left_dma
+        self.right_dma = right_dma
+        self.sendchannel_left = left_dma.sendchannel
+        self.sendchannel_right = right_dma.sendchannel
 
 
 class MatlabServerAdapter(object):
@@ -249,28 +266,76 @@ def build_argument_parser():
         default=3,
         help="Expected image channel count, Use 1 for grayscale and 3 for RGB"
     )
+    parser.add_argument(
+        "--overlay-bit",
+        default=DEFAULT_OVERLAY_BIT,
+        help="Optional PYNQ bitstream path. Leave empty to run without FPGA fast path"
+    )
+    parser.add_argument(
+        "--left-dma-name",
+        default=DEFAULT_LEFT_DMA_NAME,
+        help="Optional left-image AXI DMA IP name from the overlay"
+    )
+    parser.add_argument(
+        "--right-dma-name",
+        default=DEFAULT_RIGHT_DMA_NAME,
+        help="Optional right-image AXI DMA IP name from the overlay"
+    )
+    parser.add_argument(
+        "--fpga-ip-base",
+        type=parse_int_auto,
+        default=DEFAULT_FPGA_IP_BASE,
+        help="AXI-Lite base address for the custom detector IP, accepts decimal or 0x hex"
+    )
+    parser.add_argument(
+        "--fpga-ip-size",
+        type=parse_int_auto,
+        default=DEFAULT_FPGA_IP_SIZE,
+        help="AXI-Lite register window size, accepts decimal or 0x hex"
+    )
     return parser
 
 
-# Build a DMA-backed FPGA cache when overlay settings are provided
-def build_fpga_cache(image_shape):
-    if not OVERLAY_BIT and not DMA_NAME:
+def parse_int_auto(value):
+    return int(str(value), 0)
+
+
+def get_overlay_ip(overlay, ip_name):
+    if not hasattr(overlay, ip_name):
+        raise ValueError("IP '%s' was not found in the loaded overlay" % ip_name)
+    return getattr(overlay, ip_name)
+
+
+# Build a stereo DMA backed FPGA cache when overlay settings are provided
+def build_fpga_cache(
+    image_shape,
+    overlay_bit="",
+    left_dma_name="",
+    right_dma_name="",
+    ip_base=DEFAULT_FPGA_IP_BASE,
+    ip_size=DEFAULT_FPGA_IP_SIZE,
+):
+    if not overlay_bit and not left_dma_name and not right_dma_name:
         return None
 
-    if not OVERLAY_BIT or not DMA_NAME:
-        raise ValueError("Both OVERLAY_BIT and DMA_NAME must be set for fpga_cache setup")
+    if not overlay_bit:
+        raise ValueError("overlay_bit must be set for fpga_cache setup")
+
+    if not left_dma_name or not right_dma_name:
+        raise ValueError("Both left_dma_name and right_dma_name are required for stereo DMA")
 
     from pynq import Overlay
 
-    overlay = Overlay(OVERLAY_BIT)
+    overlay = Overlay(overlay_bit)
+    left_dma = get_overlay_ip(overlay, left_dma_name)
+    right_dma = get_overlay_ip(overlay, right_dma_name)
+    dma_engine = StereoDmaEngine(left_dma=left_dma, right_dma=right_dma)
 
-    if not hasattr(overlay, DMA_NAME):
-        raise ValueError("DMA IP '%s' was not found in the loaded overlay" % DMA_NAME)
-
-    dma_engine = getattr(overlay, DMA_NAME)
     fpga_cache = PingPongFpgaCache(
         dma_engine=dma_engine,
-        image_shape=image_shape
+        image_shape=image_shape,
+        ip_base=ip_base,
+        ip_size=ip_size
     )
     return overlay, fpga_cache
 
@@ -291,7 +356,14 @@ def main():
 
     overlay = None
     fpga_cache = None
-    fpga_setup = build_fpga_cache(image_shape)
+    fpga_setup = build_fpga_cache(
+        image_shape=image_shape,
+        overlay_bit=args.overlay_bit,
+        left_dma_name=args.left_dma_name,
+        right_dma_name=args.right_dma_name,
+        ip_base=args.fpga_ip_base,
+        ip_size=args.fpga_ip_size
+    )
     if fpga_setup is not None:
         overlay, fpga_cache = fpga_setup
 

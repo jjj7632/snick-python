@@ -55,6 +55,12 @@ class PingPongFpgaCache(object):
     ):
         if dma_engine is None:
             raise RuntimeError("dma_engine is required for PingPongFpgaCache")
+        if not hasattr(dma_engine, "sendchannel_left") or not hasattr(dma_engine, "sendchannel_right"):
+            raise TypeError("PingPongFpgaCache requires stereo DMA with sendchannel_left and sendchannel_right")
+        if not hasattr(dma_engine.sendchannel_left, "transfer") or not hasattr(dma_engine.sendchannel_left, "wait"):
+            raise TypeError("left DMA sendchannel must expose transfer and wait")
+        if not hasattr(dma_engine.sendchannel_right, "transfer") or not hasattr(dma_engine.sendchannel_right, "wait"):
+            raise TypeError("right DMA sendchannel must expose transfer and wait")
 
         self.image_shape = tuple(image_shape)
         self.image_dtype = np.dtype(image_dtype)
@@ -185,37 +191,13 @@ class PingPongFpgaCache(object):
 
     # Submit the current stereo buffers to the required DMA engine
     def submit_dma(self, left_buffer, right_buffer):
-        if hasattr(self.dma_engine, "sendchannel_left") and hasattr(self.dma_engine, "sendchannel_right"):
-            self.dma_engine.sendchannel_left.transfer(left_buffer)
-            self.dma_engine.sendchannel_right.transfer(right_buffer)
-            return
-
-        if hasattr(self.dma_engine, "sendchannel"):
-            self.dma_engine.sendchannel.transfer(left_buffer)
-            self.dma_engine.sendchannel.wait()
-            self.dma_engine.sendchannel.transfer(right_buffer)
-            return
-
-        if hasattr(self.dma_engine, "transfer"):
-            self.dma_engine.transfer(left_buffer, right_buffer)
-            return
-
-        raise TypeError("Unsupported DMA engine interface")
+        self.dma_engine.sendchannel_left.transfer(left_buffer)
+        self.dma_engine.sendchannel_right.transfer(right_buffer)
 
     # Wait for DMA transfer to complete
     def wait_for_dma(self):
-        if hasattr(self.dma_engine, "sendchannel_left") and hasattr(self.dma_engine, "sendchannel_right"):
-            self.dma_engine.sendchannel_left.wait()
-            self.dma_engine.sendchannel_right.wait()
-            return
-
-        if hasattr(self.dma_engine, "sendchannel"):
-            self.dma_engine.sendchannel.wait()
-            return
-
-        if hasattr(self.dma_engine, "wait"):
-            self.dma_engine.wait()
-            return
+        self.dma_engine.sendchannel_left.wait()
+        self.dma_engine.sendchannel_right.wait()
 
     # Cache one frame in DDR and kick off FPGA processing when available
     def submit_frame(self, frame_number, image_data):
