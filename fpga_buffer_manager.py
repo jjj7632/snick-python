@@ -209,36 +209,6 @@ class PingPongFpgaCache(object):
     def fpga_done(self):
         return (self.read_reg_u32(STATUS) & STATUS_DONE_MASK) == STATUS_DONE_MASK
 
-    # Return a best-effort snapshot of a PYNQ DMA channel state for debug prints
-    def dma_channel_state(self, channel):
-        state = {}
-        for attribute_name in ["running", "idle", "error", "transferred"]:
-            if hasattr(channel, attribute_name):
-                try:
-                    state[attribute_name] = getattr(channel, attribute_name)
-                except Exception as exc:
-                    state[attribute_name] = "error:%s" % str(exc)
-        if hasattr(channel, "_mmio") and hasattr(channel, "_offset"):
-            try:
-                dmacr = int(channel._mmio.read(channel._offset))
-                dmasr = int(channel._mmio.read(channel._offset + 4))
-                state["dmacr"] = "0x%08X" % dmacr
-                state["dmasr"] = "0x%08X" % dmasr
-                state["halted"] = bool(dmasr & 0x00000001)
-                state["idle_bit"] = bool(dmasr & 0x00000002)
-                state["dma_int_err"] = bool(dmasr & 0x00000010)
-                state["dma_slv_err"] = bool(dmasr & 0x00000020)
-                state["dma_dec_err"] = bool(dmasr & 0x00000040)
-                state["sg_int_err"] = bool(dmasr & 0x00000100)
-                state["sg_slv_err"] = bool(dmasr & 0x00000200)
-                state["sg_dec_err"] = bool(dmasr & 0x00000400)
-                state["ioc_irq"] = bool(dmasr & 0x00001000)
-                state["dly_irq"] = bool(dmasr & 0x00002000)
-                state["err_irq"] = bool(dmasr & 0x00004000)
-            except Exception as exc:
-                state["raw_status_error"] = str(exc)
-        return state
-
     # Ensure the DMA MM2S channel is actually running before issuing a transfer
     def ensure_dma_channel_running(self, label, channel):
         if hasattr(channel, "running"):
