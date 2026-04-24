@@ -6,7 +6,7 @@ import time
 import numpy as np
 
 
-# AXI lite register memory map, we need to map these to real offsets from the IP Base
+# AXI lite register memory map, we mapped these to real offsets from the IP Base
 CTRL = 0x00
 STATUS = 0x04
 LEFT_FRAME_ADDR = 0x08
@@ -22,14 +22,22 @@ BUFFER_INDEX = 0x20
 RESULT_X = 0x24
 RESULT_Y = 0x28
 RESULT_Z = 0x2C
+LEFT_BASE_FRAME_ADDR = 0x30
+RIGHT_BASE_FRAME_ADDR = 0x34
+BASE_FRAME_VALID = 0x38
+STATUS_BUSY_MASK = 0x1
+STATUS_DONE_MASK = 0x2
+STATUS_RESULT_VALID_MASK = 0x4
 
 # IP Config
-IP_BASE = 0x43C60000    
+IP_BASE = 0x43C00000
 IP_SIZE = 0x1000
 
 # Image Config
 IMAGE_SHAPE = (1080, 1920, 3)
 IMAGE_DTYPE = np.uint8
+# MATLAB/ TCP image contract is RGB
+RED_CHANNEL_INDEX = 0
 
 
 def get_pynq_allocate():
@@ -50,7 +58,7 @@ class PingPongFpgaCache(object):
         ip_base=IP_BASE,
         ip_size=IP_SIZE,
         mem_path="/dev/mem",
-        timeout_s=1.0,
+        timeout_s=15.0,
         poll_interval_s=0.001,
     ):
         if dma_engine is None:
@@ -63,6 +71,7 @@ class PingPongFpgaCache(object):
             raise TypeError("right DMA sendchannel must expose transfer and wait")
 
         self.image_shape = tuple(image_shape)
+        self.fpga_image_shape = self.get_fpga_image_shape(self.image_shape)
         self.image_dtype = np.dtype(image_dtype)
         self.ip_base = ip_base
         self.ip_size = ip_size
@@ -77,19 +86,35 @@ class PingPongFpgaCache(object):
         self.regs = None
         self.allocate = get_pynq_allocate()
         self.left_buffers, self.right_buffers = self.allocate_buffers()
+        self.left_base_buffer, self.right_base_buffer = self.allocate_base_buffers()
+        self.base_frame_valid = False
+        self.last_submission_was_base_update = False
         self.open_registers()
+        self.initialize_base_buffers()
 
     # Allocate two ping pong frame buffers that are FPGA visible
     def allocate_buffers(self):
         left_buffers = [
-            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
-            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype),
         ]
         right_buffers = [
-            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
-            self.allocate(shape=self.image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype),
+            self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype),
         ]
         return left_buffers, right_buffers
+
+    # Allocate persistent base frame buffers that the FPGA can reference
+    def allocate_base_buffers(self):
+        left_base_buffer = self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype)
+        right_base_buffer = self.allocate(shape=self.fpga_image_shape, dtype=self.image_dtype)
+        return left_base_buffer, right_base_buffer
+
+    # FPGA fast path is processing only the red channel
+    def get_fpga_image_shape(self, image_shape):
+        if len(image_shape) >= 3:
+            return image_shape[0], image_shape[1]
+        return image_shape
 
     # Open the AXI register window on hardware
     def open_registers(self):
@@ -110,10 +135,24 @@ class PingPongFpgaCache(object):
     def current_buffer_pair(self):
         return self.left_buffers[self.write_index], self.right_buffers[self.write_index]
 
+    # Initialize base buffers to zero until frame 0 supplies the real base image
+    def initialize_base_buffers(self):
+        self.left_base_buffer.fill(0)
+        self.right_base_buffer.fill(0)
+        if hasattr(self.left_base_buffer, "flush"):
+            self.left_base_buffer.flush()
+        if hasattr(self.right_base_buffer, "flush"):
+            self.right_base_buffer.flush()
+        self.write_base_registers()
+
     # Copy an image into the current ping pong buffer
     def copy_into_buffer(self, buffer_obj, image_data):
         image_array = np.asarray(image_data, dtype=self.image_dtype)
-        if image_array.shape != self.image_shape:
+        if image_array.shape == self.image_shape and len(self.image_shape) >= 3:
+            image_array = np.ascontiguousarray(image_array[:, :, RED_CHANNEL_INDEX], dtype=self.image_dtype)
+        elif image_array.shape == self.fpga_image_shape:
+            image_array = np.ascontiguousarray(image_array, dtype=self.image_dtype)
+        else:
             raise ValueError("image shape does not match configured FPGA buffer shape")
 
         np.copyto(buffer_obj, image_array, casting="safe")
@@ -123,6 +162,15 @@ class PingPongFpgaCache(object):
     # Return the device address for the hardware backed buffer
     def buffer_address(self, buffer_obj):
         return int(buffer_obj.device_address)
+
+    # Write the persistent base frame buffer addresses into the detector registers
+    def write_base_registers(self):
+        self.write_reg_u32(LEFT_BASE_FRAME_ADDR, self.buffer_address(self.left_base_buffer))
+        self.write_reg_u32(RIGHT_BASE_FRAME_ADDR, self.buffer_address(self.right_base_buffer))
+        if self.base_frame_valid:
+            self.write_reg_u32(BASE_FRAME_VALID, 1)
+        else:
+            self.write_reg_u32(BASE_FRAME_VALID, 0)
 
     # Return a left and right image from the stereo image data
     def extract_stereo_images(self, image_data):
@@ -155,7 +203,50 @@ class PingPongFpgaCache(object):
 
     # Return whether the FPGA status register reports a busy engine
     def fpga_busy(self):
-        return (self.read_reg_u32(STATUS) & 0x1) == 1
+        return (self.read_reg_u32(STATUS) & STATUS_BUSY_MASK) == STATUS_BUSY_MASK
+
+    # Return whether the FPGA reports that a frame is fully processed
+    def fpga_done(self):
+        return (self.read_reg_u32(STATUS) & STATUS_DONE_MASK) == STATUS_DONE_MASK
+
+    # Return a best-effort snapshot of a PYNQ DMA channel state for debug prints
+    def dma_channel_state(self, channel):
+        state = {}
+        for attribute_name in ["running", "idle", "error", "transferred"]:
+            if hasattr(channel, attribute_name):
+                try:
+                    state[attribute_name] = getattr(channel, attribute_name)
+                except Exception as exc:
+                    state[attribute_name] = "error:%s" % str(exc)
+        if hasattr(channel, "_mmio") and hasattr(channel, "_offset"):
+            try:
+                dmacr = int(channel._mmio.read(channel._offset))
+                dmasr = int(channel._mmio.read(channel._offset + 4))
+                state["dmacr"] = "0x%08X" % dmacr
+                state["dmasr"] = "0x%08X" % dmasr
+                state["halted"] = bool(dmasr & 0x00000001)
+                state["idle_bit"] = bool(dmasr & 0x00000002)
+                state["dma_int_err"] = bool(dmasr & 0x00000010)
+                state["dma_slv_err"] = bool(dmasr & 0x00000020)
+                state["dma_dec_err"] = bool(dmasr & 0x00000040)
+                state["sg_int_err"] = bool(dmasr & 0x00000100)
+                state["sg_slv_err"] = bool(dmasr & 0x00000200)
+                state["sg_dec_err"] = bool(dmasr & 0x00000400)
+                state["ioc_irq"] = bool(dmasr & 0x00001000)
+                state["dly_irq"] = bool(dmasr & 0x00002000)
+                state["err_irq"] = bool(dmasr & 0x00004000)
+            except Exception as exc:
+                state["raw_status_error"] = str(exc)
+        return state
+
+    # Ensure the DMA MM2S channel is actually running before issuing a transfer
+    def ensure_dma_channel_running(self, label, channel):
+        if hasattr(channel, "running"):
+            try:
+                if not channel.running and hasattr(channel, "start"):
+                    channel.start()
+            except Exception:
+                pass
 
     # Wait for the FPGA to finish the active frame
     def wait_until_idle(self, timeout_s=None):
@@ -168,29 +259,42 @@ class PingPongFpgaCache(object):
                 raise TimeoutError("Timed out waiting for FPGA to go idle")
             time.sleep(self.poll_interval_s)
 
+    # Wait until the detector reports completion through the AXI-lite status register
+    def wait_until_complete(self, timeout_s=None):
+        if timeout_s is None:
+            timeout_s = self.timeout_s
+
+        start_time = time.time()
+        while True:
+            status = self.read_reg_u32(STATUS)
+            if (status & STATUS_DONE_MASK) and not (status & STATUS_BUSY_MASK):
+                return
+            if time.time() - start_time > timeout_s:
+                raise TimeoutError(
+                    "Timed out waiting for FPGA detector completion; last STATUS=0x%08X" % status
+                )
+            time.sleep(self.poll_interval_s)
+
     # Start the AXI DMA processing path for the current stereo buffer pair
     def start_hardware_transfer(self, left_buffer, right_buffer, frame_number):
         self.write_reg_u32(LEFT_FRAME_ADDR, self.buffer_address(left_buffer))
         self.write_reg_u32(RIGHT_FRAME_ADDR, self.buffer_address(right_buffer))
-        self.write_reg_u32(FRAME_WIDTH, self.image_shape[1])
-        self.write_reg_u32(FRAME_HEIGHT, self.image_shape[0])
-
-        if len(self.image_shape) >= 3:
-            channels = self.image_shape[2]
-        else:
-            channels = 1
-        self.write_reg_u32(FRAME_CHANS, channels)
+        self.write_reg_u32(FRAME_WIDTH, self.fpga_image_shape[1])
+        self.write_reg_u32(FRAME_HEIGHT, self.fpga_image_shape[0])
+        self.write_reg_u32(FRAME_CHANS, 1)
 
         if frame_number is None:
             self.write_reg_u32(FRAME_ID, 0xFFFFFFFF)
         else:
             self.write_reg_u32(FRAME_ID, frame_number)
         self.write_reg_u32(BUFFER_INDEX, self.write_index)
-        self.submit_dma(left_buffer, right_buffer)
         self.write_reg_u32(CTRL, 1)
+        self.submit_dma(left_buffer, right_buffer)
 
-    # Submit the current stereo buffers to the required DMA engine
+    # Submit the current stereo buffers to the DMA engine
     def submit_dma(self, left_buffer, right_buffer):
+        self.ensure_dma_channel_running("left", self.dma_engine.sendchannel_left)
+        self.ensure_dma_channel_running("right", self.dma_engine.sendchannel_right)
         self.dma_engine.sendchannel_left.transfer(left_buffer)
         self.dma_engine.sendchannel_right.transfer(right_buffer)
 
@@ -199,6 +303,13 @@ class PingPongFpgaCache(object):
         self.dma_engine.sendchannel_left.wait()
         self.dma_engine.sendchannel_right.wait()
 
+    # Store frame 0 as the persistent stereo base image for FPGA subtraction
+    def update_base_frame(self, left_image, right_image):
+        self.copy_into_buffer(self.left_base_buffer, left_image)
+        self.copy_into_buffer(self.right_base_buffer, right_image)
+        self.base_frame_valid = True
+        self.write_base_registers()
+
     # Cache one frame in DDR and kick off FPGA processing when available
     def submit_frame(self, frame_number, image_data):
         if frame_number is None:
@@ -206,6 +317,14 @@ class PingPongFpgaCache(object):
 
         self.wait_until_idle()
         left_image, right_image = self.extract_stereo_images(image_data)
+        self.last_submission_was_base_update = False
+
+        if frame_number == 0:
+            self.update_base_frame(left_image, right_image)
+            self.last_frame_number = frame_number
+            self.last_submission_was_base_update = True
+            return
+
         left_buffer, right_buffer = self.current_buffer_pair()
         self.copy_into_buffer(left_buffer, left_image)
         self.copy_into_buffer(right_buffer, right_image)
@@ -217,13 +336,29 @@ class PingPongFpgaCache(object):
 
     # Read the latest FPGA output after the DMA transfer completes
     def read_result(self):
-        self.wait_for_dma()
-        self.wait_until_idle()
+        if self.last_submission_was_base_update:
+            return {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "base_updated": True,
+            }
+
+        self.wait_until_complete()
+        status = self.read_reg_u32(STATUS)
+        left_x = self.read_reg_f32(RESULT_X)
+        left_y = self.read_reg_f32(RESULT_Y)
+        right_x = self.read_reg_f32(RESULT_Z)
 
         return {
-            "x": self.read_reg_f32(RESULT_X),
-            "y": self.read_reg_f32(RESULT_Y),
-            "z": self.read_reg_f32(RESULT_Z),
+            "x": left_x,
+            "y": left_y,
+            "z": right_x,
+            "left_x": left_x,
+            "left_y": left_y,
+            "right_x": right_x,
+            "candidate_valid": (status & STATUS_RESULT_VALID_MASK) == STATUS_RESULT_VALID_MASK,
+            "status": status,
         }
 
     # Release allocated frame buffers and AXI register mappings
@@ -241,6 +376,14 @@ class PingPongFpgaCache(object):
                 pass
         self.left_buffers = []
         self.right_buffers = []
+
+        for buffer_obj in [self.left_base_buffer, self.right_base_buffer]:
+            try:
+                buffer_obj.close()
+            except AttributeError:
+                pass
+        self.left_base_buffer = None
+        self.right_base_buffer = None
 
         if self.regs is not None:
             self.regs.close()

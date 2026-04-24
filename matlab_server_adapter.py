@@ -38,9 +38,9 @@ from shared_protocol.soc_protocol import (
 )
 
 DEFAULT_OVERLAY_BIT = ""
-DEFAULT_LEFT_DMA_NAME = ""
-DEFAULT_RIGHT_DMA_NAME = ""
-DEFAULT_FPGA_IP_BASE = 0x43C60000
+DEFAULT_LEFT_DMA_NAME = "axi_dma_left"
+DEFAULT_RIGHT_DMA_NAME = "axi_dma_right"
+DEFAULT_FPGA_IP_BASE = 0x43C00000
 DEFAULT_FPGA_IP_SIZE = 0x1000
 
 
@@ -60,7 +60,7 @@ COMMANDS_WITH_ONE_INT = {
 
 
 class StereoDmaEngine(object):
-    # Small adapter that lets the FPGA cache treat two PYNQ DMA IPs as one stereo engine
+    # Small adapter that lets the FPGA cache treat the live stereo DMAs as one engine
     def __init__(self, left_dma, right_dma):
         if not hasattr(left_dma, "sendchannel"):
             raise TypeError("left DMA object must expose sendchannel")
@@ -75,7 +75,15 @@ class StereoDmaEngine(object):
 
 class MatlabServerAdapter(object):
     # Set up the TCP server and bind it to a SoC protocol instance
-    def __init__(self, host="", port=9999, image_shape=None, protocol=None, fpga_cache=None):
+    def __init__(
+        self,
+        host="",
+        port=9999,
+        image_shape=None,
+        protocol=None,
+        fpga_cache=None,
+        disable_fpga_fast_path=False,
+    ):
         self.host = host
         self.port = port
         if image_shape is None:
@@ -85,7 +93,8 @@ class MatlabServerAdapter(object):
         self.fpga_cache = fpga_cache
         self.protocol = protocol or SoCProtocol(
             command_sender=self.send_soc_command,
-            fpga_cache=self.fpga_cache
+            fpga_cache=self.fpga_cache,
+            disable_fpga_fast_path=disable_fpga_fast_path
         )
         self.protocol.command_sender = self.send_soc_command
         self.protocol.fpga_cache = self.fpga_cache
@@ -272,16 +281,6 @@ def build_argument_parser():
         help="Optional PYNQ bitstream path. Leave empty to run without FPGA fast path"
     )
     parser.add_argument(
-        "--left-dma-name",
-        default=DEFAULT_LEFT_DMA_NAME,
-        help="Optional left-image AXI DMA IP name from the overlay"
-    )
-    parser.add_argument(
-        "--right-dma-name",
-        default=DEFAULT_RIGHT_DMA_NAME,
-        help="Optional right-image AXI DMA IP name from the overlay"
-    )
-    parser.add_argument(
         "--fpga-ip-base",
         type=parse_int_auto,
         default=DEFAULT_FPGA_IP_BASE,
@@ -292,6 +291,17 @@ def build_argument_parser():
         type=parse_int_auto,
         default=DEFAULT_FPGA_IP_SIZE,
         help="AXI-Lite register window size, accepts decimal or 0x hex"
+    )
+    parser.add_argument(
+        "--fpga-timeout-s",
+        type=float,
+        default=15.0,
+        help="Seconds to wait for the FPGA detector before timing out"
+    )
+    parser.add_argument(
+        "--disable-fpga-fast-path",
+        action="store_true",
+        help="Use CPU fallback on non-base frames to isolate FPGA DMA stalls"
     )
     return parser
 
@@ -310,32 +320,31 @@ def get_overlay_ip(overlay, ip_name):
 def build_fpga_cache(
     image_shape,
     overlay_bit="",
-    left_dma_name="",
-    right_dma_name="",
     ip_base=DEFAULT_FPGA_IP_BASE,
     ip_size=DEFAULT_FPGA_IP_SIZE,
+    timeout_s=15.0,
 ):
-    if not overlay_bit and not left_dma_name and not right_dma_name:
+    if not overlay_bit:
         return None
 
-    if not overlay_bit:
-        raise ValueError("overlay_bit must be set for fpga_cache setup")
-
-    if not left_dma_name or not right_dma_name:
-        raise ValueError("Both left_dma_name and right_dma_name are required for stereo DMA")
-
+    left_dma_name = DEFAULT_LEFT_DMA_NAME
+    right_dma_name = DEFAULT_RIGHT_DMA_NAME
     from pynq import Overlay
 
     overlay = Overlay(overlay_bit)
     left_dma = get_overlay_ip(overlay, left_dma_name)
     right_dma = get_overlay_ip(overlay, right_dma_name)
-    dma_engine = StereoDmaEngine(left_dma=left_dma, right_dma=right_dma)
+    dma_engine = StereoDmaEngine(
+        left_dma=left_dma,
+        right_dma=right_dma
+    )
 
     fpga_cache = PingPongFpgaCache(
         dma_engine=dma_engine,
         image_shape=image_shape,
         ip_base=ip_base,
-        ip_size=ip_size
+        ip_size=ip_size,
+        timeout_s=timeout_s
     )
     return overlay, fpga_cache
 
@@ -359,10 +368,9 @@ def main():
     fpga_setup = build_fpga_cache(
         image_shape=image_shape,
         overlay_bit=args.overlay_bit,
-        left_dma_name=args.left_dma_name,
-        right_dma_name=args.right_dma_name,
         ip_base=args.fpga_ip_base,
-        ip_size=args.fpga_ip_size
+        ip_size=args.fpga_ip_size,
+        timeout_s=args.fpga_timeout_s
     )
     if fpga_setup is not None:
         overlay, fpga_cache = fpga_setup
@@ -371,7 +379,8 @@ def main():
         host=args.host,
         port=args.port,
         image_shape=image_shape,
-        fpga_cache=fpga_cache
+        fpga_cache=fpga_cache,
+        disable_fpga_fast_path=args.disable_fpga_fast_path
     )
     stop_requested = {"value": False}
 
