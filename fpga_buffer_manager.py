@@ -31,40 +31,6 @@ STATUS_BUSY_MASK = 0x1
 STATUS_DONE_MASK = 0x2
 STATUS_RESULT_VALID_MASK = 0x4
 UNKNOWN_FRAME_NUMBER = 0xFFFFFFFF
-STATUS_BIT_NAMES = {
-    0: "busy",
-    1: "done",
-    2: "result_valid",
-    3: "base_valid",
-    4: "left_live_word",
-    5: "left_base_word",
-    6: "right_live_word",
-    7: "right_base_word",
-    8: "left_done",
-    9: "right_done",
-    10: "left_mask_valid",
-    11: "right_mask_valid",
-    12: "left_base_reader_busy",
-    13: "left_base_reader_done",
-    14: "right_base_reader_busy",
-    15: "right_base_reader_done",
-    16: "left_base_stream_valid",
-    17: "left_base_stream_ready",
-    18: "right_base_stream_valid",
-    19: "right_base_stream_ready",
-    20: "left_base_arvalid",
-    21: "left_base_arready",
-    22: "left_base_rvalid",
-    23: "left_base_rready",
-    24: "right_base_arvalid",
-    25: "right_base_arready",
-    26: "right_base_rvalid",
-    27: "right_base_rready",
-    28: "left_live_tvalid",
-    29: "left_live_tready",
-    30: "right_live_tvalid",
-    31: "right_live_tready",
-}
 
 # IP Config
 IP_BASE = 0x43C00000
@@ -189,10 +155,6 @@ class PingPongFpgaCache(object):
             return image_shape[0], image_shape[1]
         return image_shape
 
-    # Return the expected byte count for one one channel FPGA frame
-    def expected_frame_bytes(self):
-        return int(np.prod(self.fpga_image_shape)) * self.image_dtype.itemsize
-
     # Open the AXI register window on hardware
     def open_registers(self):
         if not os.path.exists(self.mem_path):
@@ -311,12 +273,8 @@ class PingPongFpgaCache(object):
     def fpga_busy(self):
         return (self.read_reg_u32(STATUS) & STATUS_BUSY_MASK) == STATUS_BUSY_MASK
 
-    # Return whether the FPGA reports that a frame is fully processed
-    def fpga_done(self):
-        return (self.read_reg_u32(STATUS) & STATUS_DONE_MASK) == STATUS_DONE_MASK
-
     # Ensure the DMA MM2S channel is actually running before issuing a transfer
-    def ensure_dma_channel_running(self, label, channel):
+    def ensure_dma_channel_running(self, channel):
         if hasattr(channel, "running"):
             try:
                 running = channel.running
@@ -344,85 +302,6 @@ class PingPongFpgaCache(object):
             # Set RS=1 to start the channel
             mmio_obj.write(offset, 0x00000001)
 
-    # Best effort snapshot of a DMA channel to make timeout diagnosis much easier
-    def snapshot_dma_channel(self, label, channel):
-        state = {
-            "label": label,
-            "running": None,
-            "idle": None,
-        }
-
-        try:
-            state["running"] = bool(channel.running)
-        except Exception:
-            pass
-
-        try:
-            state["idle"] = bool(channel.idle)
-        except Exception:
-            pass
-
-        mmio = getattr(channel, "_mmio", None)
-        offset = getattr(channel, "_offset", None)
-        if mmio is not None and offset is not None:
-            try:
-                dmacr = int(mmio.read(offset))
-                dmasr = int(mmio.read(offset + 0x04))
-                state["dmacr"] = "0x%08X" % dmacr
-                state["dmasr"] = "0x%08X" % dmasr
-                state["halted"] = bool(dmasr & 0x00000001)
-                state["idle_bit"] = bool(dmasr & 0x00000002)
-                state["dma_int_err"] = bool(dmasr & 0x00000010)
-                state["dma_slv_err"] = bool(dmasr & 0x00000020)
-                state["dma_dec_err"] = bool(dmasr & 0x00000040)
-                state["sg_int_err"] = bool(dmasr & 0x00000100)
-                state["sg_slv_err"] = bool(dmasr & 0x00000200)
-                state["sg_dec_err"] = bool(dmasr & 0x00000400)
-                state["ioc_irq"] = bool(dmasr & 0x00001000)
-                state["dly_irq"] = bool(dmasr & 0x00002000)
-                state["err_irq"] = bool(dmasr & 0x00004000)
-            except Exception:
-                pass
-
-        return state
-
-    def snapshot_all_dma_channels(self):
-        return {
-            "left_live": self.snapshot_dma_channel("left_live", self.dma_engine.sendchannel_left),
-            "right_live": self.snapshot_dma_channel("right_live", self.dma_engine.sendchannel_right),
-            "left_mask": self.snapshot_dma_channel("left_mask", self.dma_engine.recvchannel_left_mask),
-            "right_mask": self.snapshot_dma_channel("right_mask", self.dma_engine.recvchannel_right_mask),
-        }
-
-    def decode_status_bits(self, status):
-        active = []
-        for bit_index, name in sorted(STATUS_BIT_NAMES.items()):
-            if status & (1 << bit_index):
-                active.append(name)
-        return active
-
-    def build_timeout_context(self, status):
-        reg_snapshot = {
-            "frame_width": self.read_reg_u32(FRAME_WIDTH),
-            "frame_height": self.read_reg_u32(FRAME_HEIGHT),
-            "frame_chans": self.read_reg_u32(FRAME_CHANS),
-            "left_base_reg": "0x%08X" % self.read_reg_u32(LEFT_BASE_FRAME_ADDR),
-            "right_base_reg": "0x%08X" % self.read_reg_u32(RIGHT_BASE_FRAME_ADDR),
-            "base_valid_reg": self.read_reg_u32(BASE_FRAME_VALID),
-        }
-        return {
-            "status_hex": "0x%08X" % status,
-            "status_bits": self.decode_status_bits(status),
-            "detector_regs": reg_snapshot,
-            "live_addrs": self.last_live_addresses,
-            "base_addrs": {
-                "left_base": "0x%08X" % self.left_base_address,
-                "right_base": "0x%08X" % self.right_base_address,
-            },
-            "mask_addrs": self.last_mask_addresses,
-            "dma": self.snapshot_all_dma_channels(),
-        }
-
     # Wait for the FPGA to finish the active frame
     def wait_until_idle(self, timeout_s=None):
         if timeout_s is None:
@@ -432,9 +311,7 @@ class PingPongFpgaCache(object):
         while self.fpga_busy():
             if time.time() - start_time > timeout_s:
                 status = self.read_reg_u32(STATUS)
-                raise TimeoutError(
-                    "Timed out waiting for FPGA to go idle; context=%s" % self.build_timeout_context(status)
-                )
+                raise TimeoutError("Timed out waiting for FPGA to go idle; status=0x%08X" % status)
             time.sleep(self.poll_interval_s)
 
     # Wait until the detector reports completion through the AXI-lite status register
@@ -448,9 +325,7 @@ class PingPongFpgaCache(object):
             if (status & STATUS_DONE_MASK) and not (status & STATUS_BUSY_MASK):
                 return
             if time.time() - start_time > timeout_s:
-                raise TimeoutError(
-                    "Timed out waiting for FPGA detector completion; context=%s" % self.build_timeout_context(status)
-                )
+                raise TimeoutError("Timed out waiting for FPGA detector completion; status=0x%08X" % status)
             time.sleep(self.poll_interval_s)
 
     # Start the AXI DMA processing path for the current stereo buffer pair
@@ -466,14 +341,6 @@ class PingPongFpgaCache(object):
         else:
             self.write_reg_u32(FRAME_ID, frame_number)
         self.write_reg_u32(BUFFER_INDEX, self.write_index)
-        self.last_live_addresses = {
-            "left_live": "0x%08X" % self.buffer_address(left_buffer),
-            "right_live": "0x%08X" % self.buffer_address(right_buffer),
-        }
-        self.last_mask_addresses = {
-            "left_mask": "0x%08X" % self.buffer_address(self.left_mask_buffer),
-            "right_mask": "0x%08X" % self.buffer_address(self.right_mask_buffer),
-        }
         self.start_mask_dma()
         self.write_reg_u32(CTRL, 1)        # arm IP first
         self.submit_dma(left_buffer, right_buffer)  # then start streams
@@ -482,8 +349,8 @@ class PingPongFpgaCache(object):
     def submit_dma(self, left_buffer, right_buffer):
         left_transfer_view = left_buffer.reshape(-1)
         right_transfer_view = right_buffer.reshape(-1)
-        self.ensure_dma_channel_running("left", self.dma_engine.sendchannel_left)
-        self.ensure_dma_channel_running("right", self.dma_engine.sendchannel_right)
+        self.ensure_dma_channel_running(self.dma_engine.sendchannel_left)
+        self.ensure_dma_channel_running(self.dma_engine.sendchannel_right)
         self.dma_engine.sendchannel_left.transfer(left_transfer_view)
         self.dma_engine.sendchannel_right.transfer(right_transfer_view)
 
@@ -491,8 +358,8 @@ class PingPongFpgaCache(object):
     def start_mask_dma(self):
         left_mask_transfer_view = self.left_mask_buffer.reshape(-1)
         right_mask_transfer_view = self.right_mask_buffer.reshape(-1)
-        self.ensure_dma_channel_running("left_mask", self.dma_engine.recvchannel_left_mask)
-        self.ensure_dma_channel_running("right_mask", self.dma_engine.recvchannel_right_mask)
+        self.ensure_dma_channel_running(self.dma_engine.recvchannel_left_mask)
+        self.ensure_dma_channel_running(self.dma_engine.recvchannel_right_mask)
         self.dma_engine.recvchannel_left_mask.transfer(left_mask_transfer_view)
         self.dma_engine.recvchannel_right_mask.transfer(right_mask_transfer_view)
 
@@ -559,7 +426,6 @@ class PingPongFpgaCache(object):
             "left_mask": np.asarray(self.left_mask_buffer).copy(),
             "right_mask": np.asarray(self.right_mask_buffer).copy(),
             "candidate_valid": (status & STATUS_RESULT_VALID_MASK) == STATUS_RESULT_VALID_MASK,
-            "status": status,
             "result_x": result_x,
             "result_y": result_y,
             "result_z": result_z,
