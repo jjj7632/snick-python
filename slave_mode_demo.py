@@ -27,7 +27,7 @@ def read_log_data(sock):
     if cmd != CMD_LOG_DATA:
         raise ValueError("Expected logData command, received %s" % str(cmd))
 
-    frame_number = sock.receiveInt32()
+    frame_number = sock.receiveUint32()
     x_pos = sock.receiveFloat32()
     y_pos = sock.receiveFloat32()
     z_pos = sock.receiveFloat32()
@@ -55,7 +55,7 @@ def main():
     left_image = create_dummy_image(IMAGE_SHAPE[1], IMAGE_SHAPE[0], 180, channels=IMAGE_SHAPE[2])
     right_image = create_dummy_image(IMAGE_SHAPE[1], IMAGE_SHAPE[0], 185, channels=IMAGE_SHAPE[2])
     sock.sendCmd(CMD_PROCESS_IMAGE)
-    sock.sendInt32(200)
+    sock.sendUint32(200)
     sock.send(left_image)
     sock.send(right_image)
 

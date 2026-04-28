@@ -8,6 +8,7 @@ carry the command array protocol defined in soc_protocol.py which was outlined b
 import argparse
 import os
 import signal
+import struct
 import sys
 
 import numpy as np
@@ -40,10 +41,11 @@ from shared_protocol.soc_protocol import (
 DEFAULT_OVERLAY_BIT = ""
 DEFAULT_LEFT_DMA_NAME = "axi_dma_left"
 DEFAULT_RIGHT_DMA_NAME = "axi_dma_right"
+DEFAULT_LEFT_MASK_DMA_NAME = "axi_dma_left_mask"
+DEFAULT_RIGHT_MASK_DMA_NAME = "axi_dma_right_mask"
 DEFAULT_FPGA_IP_BASE = 0x43C00000
 DEFAULT_FPGA_IP_SIZE = 0x1000
-
-
+UNKNOWN_FRAME_NUMBER = 0xFFFFFFFF
 COMMANDS_WITHOUT_ARGS = {
     CMD_REQUEST_LATEST_IMAGE,
     CMD_RESET,
@@ -52,25 +54,36 @@ COMMANDS_WITHOUT_ARGS = {
     CMD_STOP_CAPTURE,
 }
 
-COMMANDS_WITH_ONE_INT = {
-    CMD_REQUEST_IMAGE_AT_FRAME,
+COMMANDS_WITH_ONE_SIGNED_INT = {
     CMD_REQUEST_NTH_NEXT_IMAGE,
     CMD_REQUEST_NTH_PREVIOUS_IMAGE,
+}
+
+COMMANDS_WITH_ONE_UINT = {
+    CMD_REQUEST_IMAGE_AT_FRAME,
 }
 
 
 class StereoDmaEngine(object):
     # Small adapter that lets the FPGA cache treat the live stereo DMAs as one engine
-    def __init__(self, left_dma, right_dma):
+    def __init__(self, left_dma, right_dma, left_mask_dma, right_mask_dma):
         if not hasattr(left_dma, "sendchannel"):
             raise TypeError("left DMA object must expose sendchannel")
         if not hasattr(right_dma, "sendchannel"):
             raise TypeError("right DMA object must expose sendchannel")
+        if not hasattr(left_mask_dma, "recvchannel"):
+            raise TypeError("left mask DMA object must expose recvchannel")
+        if not hasattr(right_mask_dma, "recvchannel"):
+            raise TypeError("right mask DMA object must expose recvchannel")
 
         self.left_dma = left_dma
         self.right_dma = right_dma
+        self.left_mask_dma = left_mask_dma
+        self.right_mask_dma = right_mask_dma
         self.sendchannel_left = left_dma.sendchannel
         self.sendchannel_right = right_dma.sendchannel
+        self.recvchannel_left_mask = left_mask_dma.recvchannel
+        self.recvchannel_right_mask = right_mask_dma.recvchannel
 
 
 class MatlabServerAdapter(object):
@@ -82,7 +95,9 @@ class MatlabServerAdapter(object):
         image_shape=None,
         protocol=None,
         fpga_cache=None,
-        disable_fpga_fast_path=False,
+        disable_hardware=False,
+        disable_fast_path=False,
+        disable_fpga_fast_path=None,
     ):
         self.host = host
         self.port = port
@@ -91,10 +106,13 @@ class MatlabServerAdapter(object):
         self.image_shape = tuple(image_shape)
         self.socket = NumpySocket(image_shape=self.image_shape)
         self.fpga_cache = fpga_cache
+        if disable_fpga_fast_path is not None:
+            disable_fast_path = bool(disable_fpga_fast_path)
         self.protocol = protocol or SoCProtocol(
             command_sender=self.send_soc_command,
             fpga_cache=self.fpga_cache,
-            disable_fpga_fast_path=disable_fpga_fast_path
+            disable_hardware=disable_hardware,
+            disable_fast_path=disable_fast_path,
         )
         self.protocol.command_sender = self.send_soc_command
         self.protocol.fpga_cache = self.fpga_cache
@@ -160,23 +178,27 @@ class MatlabServerAdapter(object):
         if cmd in COMMANDS_WITHOUT_ARGS:
             return [cmd]
 
-        if cmd in COMMANDS_WITH_ONE_INT:
+        if cmd in COMMANDS_WITH_ONE_SIGNED_INT:
             return [cmd, self.socket.receiveInt32()]
+
+        if cmd in COMMANDS_WITH_ONE_UINT:
+            return [cmd, self.restore_frame_number(self.socket.receiveUint32())]
 
         if cmd == CMD_SEND_CALL:
             return [cmd, self.socket.receiveUint8()]
 
         if cmd == CMD_LOG_DATA:
-            frame_number = self.restore_frame_number(self.socket.receiveInt32())
+            frame_number = self.restore_frame_number(self.socket.receiveUint32())
             x_pos = self.socket.receiveFloat32()
             y_pos = self.socket.receiveFloat32()
             z_pos = self.socket.receiveFloat32()
             return [cmd, frame_number, x_pos, y_pos, z_pos]
 
         if cmd == CMD_PROCESS_IMAGE:
-            frame_number = self.restore_frame_number(self.socket.receiveInt32())
+            frame_number = self.restore_frame_number(self.socket.receiveUint32())
             left_image = self.socket.receive()
             right_image = self.socket.receive()
+            
             image_data = {
                 "left_image": left_image,
                 "right_image": right_image
@@ -195,8 +217,12 @@ class MatlabServerAdapter(object):
         if cmd in COMMANDS_WITHOUT_ARGS:
             return
 
-        if cmd in COMMANDS_WITH_ONE_INT:
+        if cmd in COMMANDS_WITH_ONE_SIGNED_INT:
             self.socket.sendInt32(command[1])
+            return
+
+        if cmd in COMMANDS_WITH_ONE_UINT:
+            self.send_matlab_uint32(self.normalize_frame_number(command[1]))
             return
 
         if cmd == CMD_SEND_CALL:
@@ -205,17 +231,19 @@ class MatlabServerAdapter(object):
             else:
                 value = 0
             self.socket.sendUint8(value)
+            if len(command) >= 3:
+                self.send_matlab_uint32(self.normalize_frame_number(command[2]))
             return
 
         if cmd == CMD_LOG_DATA:
-            self.socket.sendInt32(self.normalize_frame_number(command[1]))
-            self.socket.sendFloat32(command[2])
-            self.socket.sendFloat32(command[3])
-            self.socket.sendFloat32(command[4])
+            self.send_matlab_uint32(self.normalize_frame_number(command[1]))
+            self.send_matlab_float32(command[2])
+            self.send_matlab_float32(command[3])
+            self.send_matlab_float32(command[4])
             return
 
         if cmd == CMD_PROCESS_IMAGE:
-            self.socket.sendInt32(self.normalize_frame_number(command[1]))
+            self.send_matlab_uint32(self.normalize_frame_number(command[1]))
             image_data = command[2]
             if isinstance(image_data, dict) and "left_image" in image_data and "right_image" in image_data:
                 left_image = image_data["left_image"]
@@ -228,17 +256,40 @@ class MatlabServerAdapter(object):
 
         raise ValueError("Unsupported command for socket send: %s" % str(cmd))
 
-    # Convert frame numbers into the int32 wire representation
+    # MATLAB tcpclient read(..., "uint32") is currently consuming frame ids in host byte order.
+    def send_matlab_uint32(self, value):
+        self.socket.activeSocket().sendall(struct.pack("<I", int(value)))
+
+    # MATLAB tcpclient read(..., "single") is currently consuming float values in host byte order.
+    def send_matlab_float32(self, value):
+        self.socket.activeSocket().sendall(struct.pack("<f", float(value)))
+
+    # Convert frame numbers into the uint32 wire representation
     def normalize_frame_number(self, frame_number):
         if frame_number is None:
-            return -1
-        return int(frame_number)
+            return UNKNOWN_FRAME_NUMBER
+
+        value = int(frame_number)
+        if value < 0 or value >= UNKNOWN_FRAME_NUMBER:
+            raise ValueError("frame_number must fit in uint32 and reserve 0xFFFFFFFF for unknown")
+        return value
 
     # Convert the frame number back into Python side form
     def restore_frame_number(self, frame_number):
-        if frame_number is None or frame_number < 0:
+        if frame_number is None or int(frame_number) == UNKNOWN_FRAME_NUMBER:
             return None
-        return frame_number
+
+        value = int(frame_number)
+        # MATLAB tcpclient write(..., "uint32") on Windows is currently sending
+        # host-endian bytes, while the Python protocol expects network order.
+        # Normalize obviously byte-swapped frame numbers here so the rest of the
+        # stack can stay unchanged until the GUI-side writer is cleaned up.
+        if value > 0x00FFFFFF:
+            swapped = struct.unpack("<I", struct.pack(">I", value))[0]
+            if 0 <= swapped < value:
+                return int(swapped)
+
+        return value
 
 
 # Define command line flags for the TCP adapter process
@@ -299,9 +350,16 @@ def build_argument_parser():
         help="Seconds to wait for the FPGA detector before timing out"
     )
     parser.add_argument(
+        "--disable-hardware",
         "--disable-fpga-fast-path",
+        dest="disable_hardware",
         action="store_true",
-        help="Use CPU fallback on non-base frames to isolate FPGA DMA stalls"
+        help="Skip FPGA hardware and run the FAST algorithm in software during master mode"
+    )
+    parser.add_argument(
+        "--disable-fast-path",
+        action="store_true",
+        help="Skip both hardware FAST and software FAST, and use the fallback algorithm directly in master mode"
     )
     return parser
 
@@ -329,14 +387,20 @@ def build_fpga_cache(
 
     left_dma_name = DEFAULT_LEFT_DMA_NAME
     right_dma_name = DEFAULT_RIGHT_DMA_NAME
+    left_mask_dma_name = DEFAULT_LEFT_MASK_DMA_NAME
+    right_mask_dma_name = DEFAULT_RIGHT_MASK_DMA_NAME
     from pynq import Overlay
 
     overlay = Overlay(overlay_bit)
     left_dma = get_overlay_ip(overlay, left_dma_name)
     right_dma = get_overlay_ip(overlay, right_dma_name)
+    left_mask_dma = get_overlay_ip(overlay, left_mask_dma_name)
+    right_mask_dma = get_overlay_ip(overlay, right_mask_dma_name)
     dma_engine = StereoDmaEngine(
         left_dma=left_dma,
-        right_dma=right_dma
+        right_dma=right_dma,
+        left_mask_dma=left_mask_dma,
+        right_mask_dma=right_mask_dma
     )
 
     fpga_cache = PingPongFpgaCache(
@@ -365,22 +429,30 @@ def main():
 
     overlay = None
     fpga_cache = None
-    fpga_setup = build_fpga_cache(
-        image_shape=image_shape,
-        overlay_bit=args.overlay_bit,
-        ip_base=args.fpga_ip_base,
-        ip_size=args.fpga_ip_size,
-        timeout_s=args.fpga_timeout_s
-    )
-    if fpga_setup is not None:
-        overlay, fpga_cache = fpga_setup
+    if not args.disable_hardware:
+        fpga_setup = build_fpga_cache(
+            image_shape=image_shape,
+            overlay_bit=args.overlay_bit,
+            ip_base=args.fpga_ip_base,
+            ip_size=args.fpga_ip_size,
+            timeout_s=args.fpga_timeout_s
+        )
+        if fpga_setup is not None:
+            overlay, fpga_cache = fpga_setup
+            print("[FPGA] DMA backed PingPongFpgaCache configured")
+    else:
+        print("[FPGA] Hardware fast path disabled by flag")
+
+    if not args.disable_hardware and fpga_cache is None:
+        print("[FPGA] No DMA cache configured so hardware FAST is unavailable")
 
     adapter = MatlabServerAdapter(
         host=args.host,
         port=args.port,
         image_shape=image_shape,
         fpga_cache=fpga_cache,
-        disable_fpga_fast_path=args.disable_fpga_fast_path
+        disable_hardware=args.disable_hardware,
+        disable_fast_path=args.disable_fast_path,
     )
     stop_requested = {"value": False}
 
