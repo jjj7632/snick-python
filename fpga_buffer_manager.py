@@ -183,6 +183,13 @@ class PingPongFpgaCache(object):
             self.base_buffer_owner.flush()
         self.write_base_registers()
 
+    # Normalize reference images so candidate scoring always compares single red-channel planes
+    def extract_reference_channel(self, image_data):
+        image_array = np.asarray(image_data, dtype=self.image_dtype)
+        if image_array.ndim >= 3:
+            return np.ascontiguousarray(image_array[:, :, LIVE_RED_CHANNEL_INDEX], dtype=self.image_dtype)
+        return np.ascontiguousarray(image_array, dtype=self.image_dtype)
+
     # Search the repo for frame 40 stereo pairs and pick the one that best matches the current scene
     def select_preload_base_buffers(self, left_reference=None, right_reference=None):
         repo_root = Path(__file__).resolve().parents[1]
@@ -206,8 +213,8 @@ class PingPongFpgaCache(object):
         if left_reference is None or right_reference is None:
             folder, left_path, right_path = candidate_pairs[0]
         else:
-            left_reference = np.asarray(left_reference, dtype=np.uint8)[::8, ::8]
-            right_reference = np.asarray(right_reference, dtype=np.uint8)[::8, ::8]
+            left_reference = self.extract_reference_channel(left_reference)[::8, ::8]
+            right_reference = self.extract_reference_channel(right_reference)[::8, ::8]
             best_choice = None
             best_score = None
             for folder, left_path, right_path in candidate_pairs:
