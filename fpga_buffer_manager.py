@@ -111,6 +111,7 @@ class PingPongFpgaCache(object):
         self.last_submission_was_base_update = False
         self.last_live_addresses = None
         self.last_mask_addresses = None
+        self.base_preload_attempted = False
         self.open_registers()
         self.reset_dma_channels()
         self.initialize_base_buffers()
@@ -176,37 +177,77 @@ class PingPongFpgaCache(object):
 
     # Initialize base buffers from the tuned preload image when available
     def initialize_base_buffers(self):
-        if self.try_preload_base_buffers():
-            return
         self.left_base_buffer.fill(0)
         self.right_base_buffer.fill(0)
         if hasattr(self.base_buffer_owner, "flush"):
             self.base_buffer_owner.flush()
         self.write_base_registers()
 
-    # Try to preload the same frame 40 stereo base used by the software FAST path
-    def try_preload_base_buffers(self):
+    # Search the repo for frame 40 stereo pairs and pick the one that best matches the current scene
+    def select_preload_base_buffers(self, left_reference=None, right_reference=None):
         repo_root = Path(__file__).resolve().parents[1]
-        left_path = None
-        right_path = None
-        for ext in (".jpg", ".jpeg", ".png"):
-            candidate_left = repo_root / "serve1" / ("LeftFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
-            candidate_right = repo_root / "serve1" / ("RightFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
-            if candidate_left.is_file() and candidate_right.is_file():
-                left_path = candidate_left
-                right_path = candidate_right
-                break
+        candidate_pairs = []
+        search_roots = [repo_root]
+        for child in sorted(repo_root.iterdir()):
+            if child.is_dir():
+                search_roots.append(child)
 
-        if left_path is None or right_path is None:
-            return False
+        for folder in search_roots:
+            for ext in (".jpg", ".jpeg", ".png"):
+                candidate_left = folder / ("LeftFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
+                candidate_right = folder / ("RightFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
+                if candidate_left.is_file() and candidate_right.is_file():
+                    candidate_pairs.append((folder, candidate_left, candidate_right))
+                    break
+
+        if not candidate_pairs:
+            return None
+
+        if left_reference is None or right_reference is None:
+            folder, left_path, right_path = candidate_pairs[0]
+        else:
+            left_reference = np.asarray(left_reference, dtype=np.uint8)[::8, ::8]
+            right_reference = np.asarray(right_reference, dtype=np.uint8)[::8, ::8]
+            best_choice = None
+            best_score = None
+            for folder, left_path, right_path in candidate_pairs:
+                left_image = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
+                right_image = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
+                if left_image is None or right_image is None:
+                    continue
+                left_candidate = np.ascontiguousarray(left_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype)[::8, ::8]
+                right_candidate = np.ascontiguousarray(right_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype)[::8, ::8]
+                score = float(np.mean(np.abs(left_reference.astype(np.int16) - left_candidate.astype(np.int16))))
+                score += float(np.mean(np.abs(right_reference.astype(np.int16) - right_candidate.astype(np.int16))))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_choice = (folder, left_path, right_path)
+            if best_choice is None:
+                return None
+            folder, left_path, right_path = best_choice
 
         left_image = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
         right_image = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
         if left_image is None or right_image is None:
-            return False
+            return None
 
-        np.copyto(self.left_base_buffer, np.ascontiguousarray(left_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype), casting="safe")
-        np.copyto(self.right_base_buffer, np.ascontiguousarray(right_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype), casting="safe")
+        left_base = np.ascontiguousarray(left_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype)
+        right_base = np.ascontiguousarray(right_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=self.image_dtype)
+        return folder, left_base, right_base
+
+    # Try to preload the same style of frame 40 stereo base used by the software FAST path
+    def try_preload_base_buffers(self, left_reference=None, right_reference=None):
+        if self.base_frame_valid:
+            return True
+        if self.base_preload_attempted and left_reference is None and right_reference is None:
+            return False
+        choice = self.select_preload_base_buffers(left_reference=left_reference, right_reference=right_reference)
+        self.base_preload_attempted = True
+        if choice is None:
+            return False
+        _folder, left_base, right_base = choice
+        np.copyto(self.left_base_buffer, left_base, casting="safe")
+        np.copyto(self.right_base_buffer, right_base, casting="safe")
         if hasattr(self.base_buffer_owner, "flush"):
             self.base_buffer_owner.flush()
         self.base_frame_valid = True
@@ -387,6 +428,9 @@ class PingPongFpgaCache(object):
         self.wait_until_idle()
         left_image, right_image = self.extract_stereo_images(image_data)
         self.last_submission_was_base_update = False
+
+        if not self.base_frame_valid:
+            self.try_preload_base_buffers(left_image, right_image)
 
         if (not self.base_frame_valid) or frame_number == 0:
             self.update_base_frame(left_image, right_image)
